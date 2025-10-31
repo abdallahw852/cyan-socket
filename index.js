@@ -1,5 +1,7 @@
 import express from "express";
 import http from "http";
+import https from "https";
+
 import { Server } from "socket.io";
 
 // ----------- Simple Trie Implementation -----------
@@ -107,11 +109,28 @@ io.on("connection", (socket) => {
   });
 });
 
-// ----------- Express Route -----------
+// ====================================================
+// BASIC HTTP ENDPOINT
+// ====================================================
 app.get("/", (req, res) => {
-  res.send("✅ Socket.IO server is running");
+    res.send("Socket.IO server is running and alive 🚀");
 });
 
-// ----------- Start Server -----------
-const PORT = 3000;
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// ====================================================
+// KEEP SERVER AWAKE ON RENDER
+// ====================================================
+setInterval(() => {
+    https.get("https://cyan-socket.onrender.com", (res) => {
+        console.log("Self-ping status:", res.statusCode);
+    }).on("error", (err) => {
+        console.error("Self-ping failed:", err.message);
+    });
+}, 10 * 60 * 1000); // every 10 minutes
+
+// ====================================================
+// START SERVER
+// ====================================================
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+});
