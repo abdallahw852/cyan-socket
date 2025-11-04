@@ -31,6 +31,14 @@ const MessageSchema = new Schema(
 );
 const Message = model("Message", MessageSchema);
 
+
+const userSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+});
+
+export const User = mongoose.models.User || mongoose.model("User", userSchema);
+
+
 // Conversation schema
 const ConversationSchema = new Schema(
   {
