@@ -1,136 +1,157 @@
 import express from "express";
 import http from "http";
 import https from "https";
-
 import { Server } from "socket.io";
+import mongoose, { Schema, model } from "mongoose";
+import jwt from "jsonwebtoken";
+import dotenv from "dotenv";
 
-// ----------- Simple Trie Implementation -----------
-class TrieNode {
-  constructor() {
-    this.children = {};
-    this.isEndOfWord = false;
-    this.socketId = null; // store socket ID here
-  }
-}
+dotenv.config();
 
-class Trie {
-  constructor() {
-    this.root = new TrieNode();
-  }
+// ====================================================
+// MONGO CONNECTION
+// ====================================================
+mongoose
+  .connect(process.env.MONGO_URI)
+  .then(() => console.log("✅ MongoDB connected"))
+  .catch((err) => console.error("❌ MongoDB connection error:", err));
 
-  insert(email, socketId) {
-    let node = this.root;
-    for (let char of email) {
-      if (!node.children[char]) {
-        node.children[char] = new TrieNode();
-      }
-      node = node.children[char];
-    }
-    node.isEndOfWord = true;
-    node.socketId = socketId;
-  }
+// ====================================================
+// MONGOOSE SCHEMAS
+// ====================================================
 
-  remove(email) {
-    const removeHelper = (node, depth = 0) => {
-      if (!node) return false;
+// Message schema
+const MessageSchema = new Schema(
+  {
+    conversation: { type: Schema.Types.ObjectId, ref: "Conversation", required: true },
+    sender: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    content: { type: String, required: true },
+  },
+  { timestamps: true }
+);
+const Message = model("Message", MessageSchema);
 
-      if (depth === email.length) {
-        if (!node.isEndOfWord) return false;
-        node.isEndOfWord = false;
-        node.socketId = null;
+// Conversation schema
+const ConversationSchema = new Schema(
+  {
+    participants: [{ type: Schema.Types.ObjectId, ref: "User", required: true }],
+    lastMessage: { type: Schema.Types.ObjectId, ref: "Message", default: null },
+  },
+  { timestamps: true }
+);
+const Conversation = model("Conversation", ConversationSchema);
 
-        return Object.keys(node.children).length === 0;
-      }
-
-      const char = email[depth];
-      if (!removeHelper(node.children[char], depth + 1)) return false;
-
-      delete node.children[char];
-      return !node.isEndOfWord && Object.keys(node.children).length === 0;
-    };
-
-    removeHelper(this.root);
-  }
-
-  search(email) {
-    let node = this.root;
-    for (let char of email) {
-      if (!node.children[char]) return null;
-      node = node.children[char];
-    }
-    return node.isEndOfWord ? node.socketId : null;
-  }
-}
-
-// ----------- Express + Socket.IO Setup -----------
+// ====================================================
+// EXPRESS + SOCKET.IO SETUP
+// ====================================================
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" },
-});
+const io = new Server(server, { cors: { origin: "*" } });
 
-const trie = new Trie();
-const emailToSocket = new Map();
+// Keep track of connected users by email
+const connectedUsers = new Map(); // email -> { socketId, userId }
 
-// ----------- Socket.IO Events -----------
+// ====================================================
+// SOCKET.IO EVENTS
+// ====================================================
 io.on("connection", (socket) => {
-  console.log(`⚡ User connected: ${socket.id}`);
+  console.log(`⚡ Connected: ${socket.id}`);
 
-  // Receive user email and store in trie
-  socket.on("register", (email) => {
-    console.log(`📧 Registered: ${email} -> ${socket.id}`);
-    trie.insert(email, socket.id);
-    emailToSocket.set(email, socket.id);
-  });
+  // 1️⃣ Authenticate via manual token (for testing)
+  socket.on("authenticate", (token) => {
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-  // Handle sending messages by email
-  socket.on("send_message", ({ toEmail, message }) => {
-    const targetSocketId = trie.search(toEmail);
-    if (targetSocketId) {
-      io.to(targetSocketId).emit("receive_message", {
-        from: socket.id,
-        message,
+      socket.user = {
+        id: decoded.id,
+        email: decoded.email,
+        role: decoded.role,
+      };
+
+      console.log("✅ Authenticated user:", socket.user);
+
+      connectedUsers.set(decoded.email, {
+        socketId: socket.id,
+        userId: decoded.id,
       });
-    } else {
-      socket.emit("error_message", `❌ User ${toEmail} not found or offline`);
+
+      socket.emit("auth_success", socket.user);
+    } catch (err) {
+      console.error("❌ Invalid token", err.message);
+      socket.emit("auth_error", "Invalid or expired token");
     }
   });
 
-  // Remove user from trie on disconnect
+  // 2️⃣ Send message
+  socket.on("send_message", async ({ toEmail, content }) => {
+    if (!socket.user) return socket.emit("error", "You must authenticate first");
+
+    const recipient = connectedUsers.get(toEmail);
+    if (!recipient) return socket.emit("error", "Recipient not online");
+
+    const senderId = socket.user.id;
+    const receiverId = recipient.userId;
+
+    // Find or create conversation between both users
+    let conversation = await Conversation.findOne({
+      participants: { $all: [senderId, receiverId] },
+    });
+
+    if (!conversation) {
+      conversation = await Conversation.create({
+        participants: [senderId, receiverId],
+      });
+    }
+
+    // Create and save message
+    const message = await Message.create({
+      conversation: conversation._id,
+      sender: senderId,
+      content,
+    });
+
+    // Update last message
+    conversation.lastMessage = message._id;
+    await conversation.save();
+
+    // Send message to receiver
+    io.to(recipient.socketId).emit("receive_message", {
+      from: socket.user.email,
+      content,
+    });
+
+    console.log(`💬 ${socket.user.email} → ${toEmail}: ${content}`);
+  });
+
+  // 3️⃣ Disconnect handler
   socket.on("disconnect", () => {
-    for (const [email, id] of emailToSocket.entries()) {
-      if (id === socket.id) {
-        trie.remove(email);
-        emailToSocket.delete(email);
-        console.log(`❌ Disconnected & removed: ${email}`);
-        break;
-      }
+    if (socket.user) {
+      connectedUsers.delete(socket.user.email);
+      console.log(`❌ Disconnected: ${socket.user.email}`);
     }
   });
 });
 
 // ====================================================
-// BASIC HTTP ENDPOINT
+// BASIC EXPRESS ENDPOINT
 // ====================================================
 app.get("/", (req, res) => {
-    res.send("Socket.IO server is running and alive 🚀");
+  res.send("✅ Socket.IO server is running 🚀");
 });
 
 // ====================================================
-// KEEP SERVER AWAKE ON RENDER
+// KEEP SERVER AWAKE (Render or Railway)
 // ====================================================
 setInterval(() => {
-    https.get("https://cyan-socket.onrender.com", (res) => {
-        console.log("Self-ping status:", res.statusCode);
-    }).on("error", (err) => {
-        console.error("Self-ping failed:", err.message);
-    });
+  https
+    .get("https://cyan-socket.onrender.com", (res) =>
+      console.log("Self-ping status:", res.statusCode)
+    )
+    .on("error", (err) => console.error("Self-ping failed:", err.message));
 }, 10 * 60 * 1000); // every 10 minutes
 
 // ====================================================
 // START SERVER
 // ====================================================
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`));
