@@ -83,45 +83,52 @@ io.on("connection", (socket) => {
   });
 
   // 2️⃣ Send message
-  socket.on("send_message", async ({ toEmail, content }) => {
-    if (!socket.user) return socket.emit("error", "You must authenticate first");
+socket.on("send_message", async ({ toEmail, content }) => {
+  if (!socket.user) return socket.emit("error", "You must authenticate first");
 
-    const recipient = connectedUsers.get(toEmail);
-    if (!recipient) return socket.emit("error", "Recipient not online");
+  // find receiver by email from User collection
+  const receiver = await mongoose.model("User").findOne({ email: toEmail });
+  if (!receiver) {
+    return socket.emit("error", "Recipient not found in database");
+  }
 
-    const senderId = socket.user.id;
-    const receiverId = recipient.userId;
+  const senderId = socket.user.id;
+  const receiverId = receiver._id;
 
-    // Find or create conversation between both users
-    let conversation = await Conversation.findOne({
-      participants: { $all: [senderId, receiverId] },
+  // Find or create conversation
+  let conversation = await Conversation.findOne({
+    participants: { $all: [senderId, receiverId] },
+  });
+
+  if (!conversation) {
+    conversation = await Conversation.create({
+      participants: [senderId, receiverId],
     });
+  }
 
-    if (!conversation) {
-      conversation = await Conversation.create({
-        participants: [senderId, receiverId],
-      });
-    }
+  // Save message to DB regardless of online status
+  const message = await Message.create({
+    conversation: conversation._id,
+    sender: senderId,
+    content,
+  });
 
-    // Create and save message
-    const message = await Message.create({
-      conversation: conversation._id,
-      sender: senderId,
-      content,
-    });
+  conversation.lastMessage = message._id;
+  await conversation.save();
 
-    // Update last message
-    conversation.lastMessage = message._id;
-    await conversation.save();
-
-    // Send message to receiver
+  // Send message to receiver only if online
+  const recipient = connectedUsers.get(toEmail);
+  if (recipient) {
     io.to(recipient.socketId).emit("receive_message", {
       from: socket.user.email,
       content,
     });
-
     console.log(`💬 ${socket.user.email} → ${toEmail}: ${content}`);
-  });
+  } else {
+    console.log(`📥 ${toEmail} is offline — message stored in DB`);
+  }
+});
+
 
   // 3️⃣ Disconnect handler
   socket.on("disconnect", () => {
